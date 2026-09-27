@@ -13,7 +13,6 @@
 
 #include "../../include/challenge_scale.h"
 #include "../../include/hooks.h"
-#include "../../include/logger.h"
 #include "../../include/mod.h"
 #include "../../include/session.h"
 #include "../../include/sync.h"
@@ -22,6 +21,11 @@
 namespace DS2Coop::Sync {
 
 namespace {
+
+uintptr_t ExeBase() {
+    static const uintptr_t Base = reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
+    return Base;
+}
 
 constexpr uint32_t kGameManagerImp = 0x11613A8;
 constexpr uint32_t kDamageWriteRva = 0x16A300;
@@ -178,7 +182,7 @@ bool InstallChallengeScale(bool Enabled) {
     g_enabled.store(Enabled);
 
     // Sync settings from ModConfig
-    auto& cfg = SeamlessCoopMod::GetInstance().GetConfig();
+    const auto& cfg = DS2Coop::SeamlessCoopMod::GetInstance().GetConfig();
     g_settings.enabled = cfg.challenge_scale_enabled;
     g_settings.preset = cfg.challenge_preset;
     g_settings.mob_hp_2p = cfg.mob_hp_2p;

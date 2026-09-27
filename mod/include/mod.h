@@ -221,6 +221,7 @@ public:
     bool IsInitialized() const { return m_initialized; }
     GameVersion GetGameVersion() const { return m_gameVersion; }
     const ModConfig& GetConfig() const { return m_config; }
+    ModConfig& GetConfig() { return m_config; }
     
     void LoadConfig();
     void SaveConfig();

@@ -871,7 +871,7 @@ void Overlay::RenderSettingsPage() {
         RowText(P, Tr("Dynamic Challenge Scaling", "Динамический баланс сложности"),
                 Tr("Preserves Souls challenge for 2-3 players without nerfing damage",
                    "Балансирует сложность для 2-3 игроков"));
-        auto& Cfg = SeamlessCoopMod::GetInstance().GetConfig();
+        auto& Cfg = DS2Coop::SeamlessCoopMod::GetInstance().GetConfig();
         ImGui::SetCursorScreenPos(ImVec2(P.x + W - 90.0f * S, P.y + (RowH - 32.0f * S) * 0.5f));
         if (Kit::Button(Cfg.challenge_scale_enabled ? Tr("Active", "Вкл") : Tr("Off", "Выкл"),
                         Cfg.challenge_scale_enabled ? Kit::ButtonKind::Primary : Kit::ButtonKind::Secondary)) {
