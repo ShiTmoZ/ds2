@@ -10,19 +10,24 @@ on:
 jobs:
   build:
     name: Build dinput8.dll & Package
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure CMake
         run: |
-          cmake -S mod -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+          cmake -S mod -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
 
       - name: Build Project
         run: |
-          cmake --build build --config Release --parallel
+          cmake --build build --config Release
 
       - name: Package Release Files
         shell: pwsh
@@ -30,9 +35,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/Host
           New-Item -ItemType Directory -Force -Path dist/Joiner
 
-          # Copy compiled DLL
-          Copy-Item "build/bin/Release/dinput8.dll" -Destination "dist/Host/dinput8.dll"
-          Copy-Item "build/bin/Release/dinput8.dll" -Destination "dist/Joiner/dinput8.dll"
+          # Copy compiled DLL from build output
+          if (Test-Path "build/bin/Release/dinput8.dll") {
+              Copy-Item "build/bin/Release/dinput8.dll" -Destination "dist/Host/dinput8.dll"
+              Copy-Item "build/bin/Release/dinput8.dll" -Destination "dist/Joiner/dinput8.dll"
+          } elseif (Test-Path "build/bin/dinput8.dll") {
+              Copy-Item "build/bin/dinput8.dll" -Destination "dist/Host/dinput8.dll"
+              Copy-Item "build/bin/dinput8.dll" -Destination "dist/Joiner/dinput8.dll"
+          } elseif (Test-Path "build/src/dinput8.dll") {
+              Copy-Item "build/src/dinput8.dll" -Destination "dist/Host/dinput8.dll"
+              Copy-Item "build/src/dinput8.dll" -Destination "dist/Joiner/dinput8.dll"
+          }
 
           # Copy configuration files
           Copy-Item "release/host/ds2_seamless_coop.ini" -Destination "dist/Host/ds2_seamless_coop.ini"
