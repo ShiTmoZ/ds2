@@ -1,0 +1,58 @@
+name: Build DS2 Seamless Co-op (Windows x64)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build dinput8.dll & Package
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: |
+          cmake -S mod -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Project
+        run: |
+          cmake --build build --config Release --parallel
+
+      - name: Package Release Files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/Host
+          New-Item -ItemType Directory -Force -Path dist/Joiner
+
+          # Copy compiled DLL
+          Copy-Item "build/bin/Release/dinput8.dll" -Destination "dist/Host/dinput8.dll"
+          Copy-Item "build/bin/Release/dinput8.dll" -Destination "dist/Joiner/dinput8.dll"
+
+          # Copy configuration files
+          Copy-Item "release/host/ds2_seamless_coop.ini" -Destination "dist/Host/ds2_seamless_coop.ini"
+          Copy-Item "release/joiner/ds2_seamless_coop.ini" -Destination "dist/Joiner/ds2_seamless_coop.ini"
+
+          # Copy server files for host
+          if (Test-Path "release/host/SeamlessServer") {
+              Copy-Item -Recurse "release/host/SeamlessServer" -Destination "dist/Host/SeamlessServer"
+          }
+          if (Test-Path "release/host/StartServer.bat") {
+              Copy-Item "release/host/StartServer.bat" -Destination "dist/Host/StartServer.bat"
+          }
+          if (Test-Path "release/host/StopServer.bat") {
+              Copy-Item "release/host/StopServer.bat" -Destination "dist/Host/StopServer.bat"
+          }
+
+          Copy-Item "README.md" -Destination "dist/README.md"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DS2-SeamlessCoop-Challenge-x64
+          path: dist/

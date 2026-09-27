@@ -1,0 +1,355 @@
+// Resting at a bonfire resets the world -- for everyone in the session.
+//
+// Each client keeps its own enemies: they are spawned locally by enemy
+// generators, and the host's updates drive them only where the same generator
+// is alive on both sides. The rest reset ran on the resting player's machine
+// alone, so after a guest rested only the guest saw the respawned mobs, and the
+// host had to rest as well before they appeared there.
+//
+// The reset is exe+0x17FD70. The bonfire menu's state machine (exe+0x17ED90)
+// tail-jumps to it once per rest (exe+0x17F062). It takes nothing and reads
+// everything from the game manager:
+//
+//   exe+0x417210([GMImp+0x40])     EnemyGeneratorManager: despawn, reset all 42
+//                                  areas, queue every generator to spawn again,
+//                                  pause spawning for 6 frames (+0x331)
+//   exe+0x3C1B50 -> 0x3C27F0(0,0)  map objects back to their initial state
+//   exe+0x44F880([GMImp+0x70])     the event manager's per-rest reset
+//
+// Hooked, it tells the other players. A player told replays the original --
+// through the trampoline, so the replay is not reported back -- at the start of
+// the enemy generator manager's own update (exe+0x417810, main loop): nothing is
+// iterating the generator lists at that point, and the update only runs while a
+// world is loaded, so a reset that arrives during a loading screen simply waits.
+//
+// One reset per rest, not two (17.09, point 11). When both players rest within
+// seconds of each other, every machine used to reset twice: its own rest, then the
+// replay of the partner's. A second reset lands while the first one's enemies are
+// still being put in; the respawn (exe+0x40E3E0 -> exe+0x40F9C0) forgets every
+// record's character but destroys only those of generators in states 4-6, so a
+// character caught half-way stays where it stood while a fresh copy appears at its
+// starting spot -- the doubled enemies of the report. So a reset closer than
+// kResetDedupMs to the previous one on this machine is skipped, in either order.
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+
+#include "../../include/sync.h"
+#include "../../include/hooks.h"
+#include "../../include/network.h"
+#include "../../include/session.h"
+#include "../../include/ui.h"
+#include "../../include/ui_settings.h"
+#include "../../include/utils.h"
+
+#include <atomic>
+#include <mutex>
+#include <string>
+
+using namespace DS2Coop::Utils;
+
+namespace DS2Coop::Sync {
+
+namespace {
+
+constexpr uint32_t kRestResetRva = 0x17FD70;   // world reset on rest
+constexpr uint32_t kGenUpdateRva = 0x417810;   // EnemyGeneratorManager update
+constexpr ULONGLONG kResetDedupMs = 10000;     // a reset this soon after the last one here adds nothing
+
+// The reset takes no arguments; the detour forwards the four argument registers
+// untouched anyway, in case the caller left something the game relies on.
+using RestResetFn = void(__fastcall*)(void*, void*, void*, void*);
+using GenUpdateFn = void(__fastcall*)(void*, float*);
+
+RestResetFn g_restReset = nullptr;
+GenUpdateFn g_genUpdate = nullptr;
+
+std::atomic<bool> g_installed{ false };
+std::atomic<bool> g_enabled{ true };
+std::atomic<bool> g_pending{ false };
+std::atomic<bool> g_broken{ false };   // a replay threw once: stop replaying this run
+std::atomic<ULONGLONG> g_lastResetAt{ 0 };   // the last reset that ran here, own rest or replay
+std::atomic<bool>      g_lastWasReplay{ false };
+
+// How long ago the world was last reset here, or ~0 if never.
+ULONGLONG SinceLastReset() {
+    const ULONGLONG At = g_lastResetAt.load();
+    return At ? GetTickCount64() - At : ~0ull;
+}
+std::mutex        g_fromMutex;
+std::string       g_pendingFrom;
+
+bool HavePartner() {
+    return Session::SessionManager::GetInstance().GetPlayers().size() > 1;
+}
+
+// A guest in someone else's world right now: the join controller
+// ([[netRoot+0x18]+0x40], NetSummonJoinMultiplayCtrl) is in state 7.
+bool InHostWorld() {
+    __try {
+        const uintptr_t Base = reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
+        const uintptr_t Root = *reinterpret_cast<const uintptr_t*>(Base + 0x1616CF8);
+        if (!Root) return false;
+        const uintptr_t Mp = *reinterpret_cast<const uintptr_t*>(Root + 0x18);
+        if (!Mp) return false;
+        const uintptr_t Ctrl = *reinterpret_cast<const uintptr_t*>(Mp + 0x40);
+        if (!Ctrl) return false;
+        if (*reinterpret_cast<const uintptr_t*>(Ctrl) != Base + 0x10D7BD8) return false;
+        return *reinterpret_cast<const int32_t*>(Ctrl + 0xF8) == 7;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Whether a rest here and a rest there are rests in the same world.
+//
+// The world reset removes every generator's character and then re-arms them,
+// NPCs included, and on 16.09 the host kept losing its NPCs to replays of a
+// guest's rest taken while the guest was back in its OWN world (18:54:57,
+// 19:04:45, 19:16:19, 19:28:34): the lobby had two players, so the rest was
+// passed on, and the host's world was reset for a rest that happened somewhere
+// else. A rest only means something to the other player when both stand in the
+// same world -- which, for a guest, is the host's.
+bool InSharedWorld() {
+    return Session::SessionManager::GetInstance().IsHost() || InHostWorld();
+}
+
+void BroadcastReset() {
+    Network::PacketHeader Header{};
+    Header.magic = 0x44533243;
+    Header.type = Network::PacketType::WorldReset;
+    Header.size = sizeof(Header);
+    Header.timestamp = GetTickCount64();
+    Network::PeerManager::GetInstance().BroadcastPacket(&Header);
+}
+
+// Everything the mod holds about this world is older than a reset of it, and it all goes before the
+// reset runs, not after: a reset takes every generator's character away and makes the blocks again as
+// it runs, and the mod puts what it knows into a block as the block is made (GenAreaCreateDetour).
+// Dropping it afterwards, the way it was until 21.09 morning, came exactly one beat too late -- the
+// states kept from the join ("these were dead when I came in") went straight back into the blocks the
+// reset had just rebuilt, and the enemies that had stood up died where they stood (checklist 9, said
+// twice now: 19.09 and 21.09).
+// A guest's own rest does not put the map's objects back (21.09 morning, checklist 5; 21.09 night,
+// report 11: "the host was riding the lift, I sat down at a bonfire, and after that the lift button
+// was stuck for him").
+//
+// The rest reset is three steps (exe+0x17FD70): the enemies, then the map's objects (exe+0x3C1B50),
+// then the event scripts. The middle one is the trouble for a guest: the objects it puts back are its
+// own copy of the HOST's world -- the lift the host is standing on, the gate the host opened -- and
+// every one of those changes goes straight to the host as a map object packet, which is how the
+// host's lift button ended up pressed-and-never-released. Nothing is lost by leaving them: the guest
+// is not in its own world, and the host's rest still resets them for both.
+//
+// Only while this game's own rest reset is running, and only for a guest in the host's world.
+constexpr uint32_t kObjResetAll = 0x3C1B50;   // (): every map object back to the state its map starts in
+void* g_objResetOriginal = nullptr;
+bool  g_inOwnRest = false;                    // game thread only
+
+// A reset of this world takes every enemy away and makes them again. Other parts of the mod need to
+// know that it is happening right now, or has just happened: what the game does during those few
+// frames is bookkeeping, not play. See WorldResetRunningOrFresh below.
+std::atomic<bool> g_resetRunning{ false };
+
+void __fastcall ObjResetAllDetour() {
+    if (g_inOwnRest && g_enabled.load() && !Session::SessionManager::GetInstance().IsHost() && InHostWorld()) {
+        static uint32_t s_told = 0;
+        if (++s_told <= 5) {
+            LOG_INFO("[WORLD] resting in the host's world: the map's objects stay as they are (its lifts, gates "
+                     "and bridges are the host's, and putting them back here would put them back there too)");
+        }
+        return;
+    }
+    reinterpret_cast<void(__fastcall*)()>(g_objResetOriginal)();
+}
+
+void DropWhatIsOlderThanTheReset(const char* Why) {
+    ForgetGuestDropRolls();   // respawned enemies can drop again
+    ForgetHostEnemyStatesAfterRest(Why);
+    ForgetKeptLiveStatesAfterRest(Why);
+    MapObjectsAfterRest(Why);
+}
+
+void __fastcall RestResetDetour(void* A, void* B, void* C, void* D) {
+    // Just reset for the partner's rest in this same world: that reset was this one.
+    const ULONGLONG Since = SinceLastReset();
+    if (g_enabled.load() && HavePartner() && InSharedWorld() && g_lastWasReplay.load() && Since < kResetDedupMs) {
+        LOG_INFO("[WORLD] rested here %llu ms after the partner's rest reset this world -- not reset a second time, "
+                 "and nobody is told", static_cast<unsigned long long>(Since));
+        return;
+    }
+    DropWhatIsOlderThanTheReset("a rest here respawns the enemies");
+    NoteLocalRestForPose();
+    g_inOwnRest = true;
+    g_resetRunning.store(true);
+    g_restReset(A, B, C, D);
+    g_resetRunning.store(false);
+    g_inOwnRest = false;
+    g_lastResetAt.store(GetTickCount64());
+    g_lastWasReplay.store(false);
+    ChallengeScaleOnReset();
+    if (!g_enabled.load() || !HavePartner()) return;
+    if (!InSharedWorld()) {
+        LOG_INFO("[WORLD] rested in my own world while a guest of the lobby -- that is not the host's world, "
+                 "so nobody else is reset");
+        return;
+    }
+    LOG_INFO("[WORLD] rested here -- the world was reset; telling the other players");
+    BroadcastReset();
+    UI::Overlay::GetInstance().ShowNotification(
+        UI::Tr("Enemies respawned for your partner too", "Враги возродились и у напарника"),
+        3.5f, UI::NotifyKind::Player);
+}
+
+// The partner's rest replayed here (18.09, point 4: the guest rested in Majula and the Emerald
+// Herald was gone for the host until the host rested itself). exe+0x17FD70 is three steps:
+// exe+0x417210([GMImp+0x40]) -- every generator's character taken away and made again (the enemies
+// back); exe+0x3C1B50() -- the map's objects (barrels and boxes); and a tail jump to
+// exe+0x44F880([GMImp+0x70]) -- the flags whose (id/10000)%100 is 2 zeroed and every event task's
+// script destroyed. The last one is what a replay must not do: an NPC whose generator waits for its
+// event task comes back only once that task runs again, and some of them run again only after a real
+// rest -- in the host's log group 10402 read empty right after each replay (21:53:18, 21:58:02) and
+// 104020149 came back only after the host's own rest (21:54:22). So a replay takes the first two
+// steps; the full reset stays behind ini rest_replay_full.
+std::atomic<bool> g_replayFull{ false };
+constexpr uint32_t kGenResetAll  = 0x417210;   // (generator manager)
+
+// No C++ objects in here: the replay runs under SEH.
+bool ReplayResetSafely() {
+    __try {
+        if (g_replayFull.load()) {
+            g_restReset(nullptr, nullptr, nullptr, nullptr);
+            return true;
+        }
+        const uintptr_t Base = reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr));
+        const uintptr_t Gm = *reinterpret_cast<const uintptr_t*>(Base + 0x16148F0);
+        const uintptr_t GenMgr = Gm ? *reinterpret_cast<const uintptr_t*>(Gm + 0x40) : 0;
+        if (GenMgr) reinterpret_cast<void(__fastcall*)(uintptr_t)>(Base + kGenResetAll)(GenMgr);
+        // The map's objects are left alone (21.09, point 11: the host rode the lift up, the guest sat at
+        // a bonfire, and the button stayed pressed -- the replay had put the lift back to how it loads
+        // while the host was standing on it). A rest of one's own still resets them, as the game does.
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The partner's rest, in the order a rest of one's own takes: what the mod holds goes first.
+bool DropAndReplayReset(const char* Why) {
+    DropWhatIsOlderThanTheReset(Why);
+    g_resetRunning.store(true);
+    const bool Ok = ReplayResetSafely();
+    g_resetRunning.store(false);
+    return Ok;
+}
+
+void __fastcall GenUpdateDetour(void* Manager, float* Dt) {
+    g_inOwnRest = false;   // it only ever spans one call inside a frame; never let it outlive one
+    // The same safe spot on the game thread serves the world item toggle and
+    // the free-travel code bytes (never written while the game runs them).
+    LootSyncGameTick();
+    FreeTravelGameTick();
+    DeathSyncGameTick();
+    GuestDropsTick();
+    SummonAcceptGameTick();
+    PvpModesGameTick();
+    EstusGameTick();
+    NpcProgressGameTick();
+    BonfireLitGameTick();
+    ChrDeathTick();
+    EnemyReconcileTick();
+    ChestLidsTick();
+    EventViewProbeTick();
+    PartnerLookTick();
+    MapStateActTick();
+    MapObjectsTick();
+    ChallengeScaleGameTick();
+    if (g_pending.exchange(false) && g_enabled.load() && !g_broken.load()) {
+        std::string From;
+        {
+            std::lock_guard<std::mutex> Lock(g_fromMutex);
+            From = g_pendingFrom;
+        }
+        const ULONGLONG Since = SinceLastReset();
+        if (!InSharedWorld()) {
+            LOG_INFO("[WORLD] %s rested, but I am not in their world right now -- nothing here to reset",
+                     From.c_str());
+        } else if (Since < kResetDedupMs) {
+            LOG_INFO("[WORLD] %s rested %llu ms after the world was last reset here -- already fresh, not reset "
+                     "a second time", From.c_str(), static_cast<unsigned long long>(Since));
+        } else if (DropAndReplayReset("the partner's rest respawns the enemies here")) {
+            g_lastResetAt.store(GetTickCount64());
+            g_lastWasReplay.store(true);
+            ChallengeScaleOnReset();
+            LOG_INFO("[WORLD] %s rested -- the world was reset here too", From.c_str());
+            UI::Overlay::GetInstance().ShowNotification(
+                UI::Format(UI::Tr("%s rested at a bonfire \xE2\x80\x94 enemies are back",
+                                  "Игрок %s отдохнул у костра \xE2\x80\x94 враги возродились"),
+                           From.c_str()),
+                4.0f, UI::NotifyKind::Player);
+        } else {
+            g_broken.store(true);
+            LOG_ERROR("[WORLD] replaying the rest reset threw -- rest sync is off for this run");
+        }
+    }
+    g_genUpdate(Manager, Dt);
+}
+
+bool Hook(uint32_t Rva, void* Detour, void** Original, const char* What) {
+    void* Target = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(GetModuleHandle(nullptr)) + Rva);
+    if (Hooks::HookManager::GetInstance().InstallHook(Target, Detour, Original)) return true;
+    LOG_WARNING("[WORLD] could not hook %s at exe+0x%X", What, Rva);
+    return false;
+}
+
+} // namespace
+
+void SetRestReplayFull(bool On) {
+    g_replayFull.store(On);
+}
+
+// A reset of this world is running, or ended less than WithinMs ago (21.09 evening, checklist 5:
+// "the enemies stand up and die on the spot, and now it happens at the host as well"). The reset
+// takes every character away and makes it again, and in a session that shows up as deaths: the kill
+// counters of the guest went up by two at every single rest -- 4, 6, 8 -- with the host reporting no
+// kills at all. Nothing that comes in over those few frames is play, so the parts of the mod that
+// answer for a death ask here first.
+bool WorldResetRunningOrFresh(unsigned long long WithinMs) {
+    if (g_resetRunning.load()) return true;
+    const ULONGLONG At = g_lastResetAt.load();
+    return At != 0 && GetTickCount64() - At < WithinMs;
+}
+
+bool InstallWorldSync() {
+    if (g_installed.exchange(true)) return g_restReset && g_genUpdate;
+    const bool Reset = Hook(kRestResetRva, reinterpret_cast<void*>(&RestResetDetour),
+                            reinterpret_cast<void**>(&g_restReset), "the rest reset");
+    const bool Update = Reset && Hook(kGenUpdateRva, reinterpret_cast<void*>(&GenUpdateDetour),
+                                      reinterpret_cast<void**>(&g_genUpdate), "the enemy generator update");
+    Hook(kObjResetAll, reinterpret_cast<void*>(&ObjResetAllDetour), &g_objResetOriginal,
+         "the map objects of a rest reset");
+    LOG_INFO("[WORLD] rest sync %s", Reset && Update ? "hooked (exe+0x17FD70, exe+0x417810)" : "unavailable");
+    return Reset && Update;
+}
+
+void SetWorldSyncEnabled(bool enabled) {
+    g_enabled.store(enabled);
+    LOG_INFO("[WORLD] rest sync %s", enabled ? "ON: one player's rest respawns everyone's enemies" : "OFF");
+}
+
+void RequestWorldReset(const std::string& fromName) {
+    if (!g_enabled.load() || !g_restReset || !g_genUpdate) return;
+    {
+        std::lock_guard<std::mutex> Lock(g_fromMutex);
+        g_pendingFrom = fromName;
+    }
+    g_pending.store(true);
+    LOG_INFO("[WORLD] %s rested -- resetting the world here on the next enemy update", fromName.c_str());
+}
+
+} // namespace DS2Coop::Sync
