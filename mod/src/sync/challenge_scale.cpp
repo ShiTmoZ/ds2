@@ -61,6 +61,16 @@ bool ReadI32(uintptr_t Addr, int32_t* Out) {
     }
 }
 
+bool ReadU32(uintptr_t Addr, uint32_t* Out) {
+    __try {
+        *Out = *reinterpret_cast<const uint32_t*>(Addr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *Out = 0;
+        return false;
+    }
+}
+
 bool IsPlayerCharacterSafe(uintptr_t Chr, uintptr_t LocalChr) {
     if (!Chr) return false;
     if (LocalChr && Chr == LocalChr) return true;
@@ -118,6 +128,35 @@ void __fastcall DamageWriteDetour(uintptr_t Chr, int32_t Damage, uint32_t Arg3, 
     }
 }
 
+bool ScaleSingleChrSafe(uintptr_t chr, float mult) {
+    __try {
+        const int32_t curHp = *reinterpret_cast<const int32_t*>(chr + 0x168);
+        const int32_t maxHp = *reinterpret_cast<const int32_t*>(chr + 0x170);
+        const int32_t baseMax = *reinterpret_cast<const int32_t*>(chr + 0x174);
+
+        if (curHp <= 0 || maxHp <= 0) return false;
+
+        const int32_t newMax = static_cast<int32_t>(maxHp * mult);
+        const int32_t newBase = static_cast<int32_t>(baseMax * mult);
+        const int32_t newCur = static_cast<int32_t>(curHp * mult);
+
+        *reinterpret_cast<int32_t*>(chr + 0x170) = newMax;
+        *reinterpret_cast<int32_t*>(chr + 0x174) = newBase;
+        *reinterpret_cast<int32_t*>(chr + 0x168) = newCur;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+int32_t GetChrMaxHpSafe(uintptr_t chr) {
+    __try {
+        return *reinterpret_cast<const int32_t*>(chr + 0x170);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 void ScanAndScaleEnemiesSafe() {
     const int count = GetChallengeActivePlayerCount();
     if (count < 2) return;
@@ -138,7 +177,7 @@ void ScanAndScaleEnemiesSafe() {
         if (!ReadPtr(GenMgr + 0x20 + slot * 8, &block)) continue;
         uintptr_t first = 0;
         uint32_t n = 0;
-        if (!ReadPtr(block + 0x18, &first) || !ReadPtr(block + 0x20, &n)) continue;
+        if (!ReadPtr(block + 0x18, &first) || !ReadU32(block + 0x20, &n)) continue;
         if (!first || n == 0 || n > 256) continue;
 
         for (uint32_t i = 0; i < n; ++i) {
@@ -149,27 +188,14 @@ void ScanAndScaleEnemiesSafe() {
             if (g_scaledChrs.contains(chr)) continue;
             if (IsPlayerCharacterSafe(chr, Local)) continue;
 
-            __try {
-                const int32_t curHp = *reinterpret_cast<const int32_t*>(chr + 0x168);
-                const int32_t maxHp = *reinterpret_cast<const int32_t*>(chr + 0x170);
-                const int32_t baseMax = *reinterpret_cast<const int32_t*>(chr + 0x174);
+            const int32_t maxHp = GetChrMaxHpSafe(chr);
+            if (maxHp <= 0) continue;
 
-                if (curHp <= 0 || maxHp <= 0) continue;
+            const bool isBoss = isBossFight || maxHp >= 2500;
+            const float mult = isBoss ? bossHpMult : mobHpMult;
 
-                const bool isBoss = isBossFight || maxHp >= 2500;
-                const float mult = isBoss ? bossHpMult : mobHpMult;
-
-                const int32_t newMax = static_cast<int32_t>(maxHp * mult);
-                const int32_t newBase = static_cast<int32_t>(baseMax * mult);
-                const int32_t newCur = static_cast<int32_t>(curHp * mult);
-
-                *reinterpret_cast<int32_t*>(chr + 0x170) = newMax;
-                *reinterpret_cast<int32_t*>(chr + 0x174) = newBase;
-                *reinterpret_cast<int32_t*>(chr + 0x168) = newCur;
-
+            if (ScaleSingleChrSafe(chr, mult)) {
                 g_scaledChrs.insert(chr);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Safely ignore unmapped/transient records
             }
         }
     }
