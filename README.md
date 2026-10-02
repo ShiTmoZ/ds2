@@ -30,17 +30,17 @@ In vanilla co-op setups, playing with 2 or 3 players turns Dark Souls II into an
 
 ## 📦 Available Releases (Choose Your Flavor)
 
-Head over to the **[Releases Section](https://github.com/ShiTmoZ/ds2/releases/tag/v0.3.0)** to download:
+Head over to the **[Releases Section](https://github.com/ShiTmoZ/ds2/releases/tag/v0.4.0)** to download:
 
 ### 🌟 Edition 1: Gold-Team & Steam Spacewar Edition (RECOMMENDED)
-**Asset:** `DS2-SeamlessCoop-GoldTeam-EnhancedChallenge-v0.3.0.zip`
-- **Architecture**: LukeYui Seamless Co-op + OnlineFix (Spacewar AppID 480).
+**Asset:** `DS2-SeamlessCoop-GoldTeam-EnhancedChallenge-v0.4.0.zip`
+- **Architecture**: LukeYui Seamless Co-op v0.0.4 + OnlineFix (Spacewar AppID 480).
 - **Zero Config**: No server hosting, no port-forwarding, no typing IP addresses.
 - **In-Game Items**: Connect effortlessly using the in-game items (`Heliograph` to host, `Fragment of Brilliance` to join).
 - **100% Antivirus Safe**: Built directly on the official Gold-Team release files with zero altered binaries.
 
 #### Quick Setup:
-1. Extract all contents of `DS2-SeamlessCoop-GoldTeam-EnhancedChallenge-v0.3.0.zip` directly into your game folder (alongside `DarkSoulsII.exe`).
+1. Extract all contents of `DS2-SeamlessCoop-GoldTeam-EnhancedChallenge-v0.4.0.zip` directly into your game folder (alongside `DarkSoulsII.exe`).
 2. Start the **Steam** desktop client in the background.
 3. Open `SeamlessCoop/ds2sc_settings.ini` with Notepad and set your matching password in `cooppassword = ...`.
 4. Launch the game using **`ds2sc_launcher.exe`**.
@@ -50,8 +50,8 @@ Head over to the **[Releases Section](https://github.com/ShiTmoZ/ds2/releases/ta
 
 ---
 
-### 🌐 Edition 2: Standalone Dedicated Server Edition
-**Asset:** `DS2-SeamlessCoop-Challenge-v0.3.0.zip`
+### 🌐 Edition 2: Standalone Dedicated Server Edition (LAN / Radmin VPN)
+**Asset:** `DS2-SeamlessCoop-Challenge-v0.4.0.zip`
 - **Architecture**: Open-source C++ hook (`dinput8.dll`) + `SeamlessServer` (ds3os).
 - **No Steam Required**: Connect over local LAN, Radmin VPN, ZeroTier, or direct IP.
 - **In-Game Overlay**: Press **F1** or **Insert** anytime to inspect lobby stats and toggle settings.
